@@ -25,6 +25,7 @@ DEFAULT_PING_TIMEOUT=2
 DEFAULT_CHECK_ROUNDS=3
 DEFAULT_ROUND_DELAY=2
 DEFAULT_MAX_PARALLEL=20
+CONFIG_TEST_OK=0
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     RESET=$'\033[0m'
@@ -91,8 +92,8 @@ prompt_secret() {
     else
         printf '%s: ' "$label" >&2
     fi
-    IFS= read -rs value || true
-    printf '\n' >&2
+    # AK/SK are intentionally visible while entering so they can be checked.
+    IFS= read -r value || true
     printf '%s\n' "$value"
 }
 
@@ -630,6 +631,7 @@ restart_daemon_if_running() {
 
 setup_config() {
     local ak sk value has_old_ak=0 has_old_sk=0
+    CONFIG_TEST_OK=0
     require_python || return 1
     load_runtime_config
     load_saved_secrets
@@ -698,6 +700,7 @@ setup_config() {
     ok "配置已保存到 ${CONFIG_FILE}（权限 600）。"
     info "正在验证华为云鉴权并查找域名..."
     if dns_command test; then
+        CONFIG_TEST_OK=1
         ok "华为云 DNS 连接正常。"
     else
         warn "配置已保存，但连接测试失败。请按上面的错误检查 AK/SK 或域名。"
@@ -981,7 +984,7 @@ main_menu() {
     while true; do
         show_menu_header
         printf '%s\n' \
-            '  1) 配置华为云 AK/SK、域名和检测规则' \
+            '  1) 首次配置 / 更新华为云 AK/SK、域名和检测规则' \
             '  2) 批量添加 IP 到域名解析' \
             '  3) 查看当前域名解析 IP' \
             '  4) 立即检测一轮并删除失效 IP' \
@@ -1042,10 +1045,25 @@ main() {
     esac
 
     require_root
+    # A fresh Debian cloud host can run the script directly; install the
+    # runtime tools before any command needs them.
+    install_dependencies || exit 1
     require_python || exit 1
 
     case "${1:-}" in
-        "") main_menu ;;
+        "")
+            # First run is one-click: after a successful configuration test,
+            # install and start the background service automatically.
+            if ! config_ready; then
+                setup_config || exit 1
+                if ((CONFIG_TEST_OK == 1)); then
+                    install_service || warn "定时服务启动失败，可稍后在菜单选择 6 重试。"
+                else
+                    warn "连接测试未通过，暂不启动定时服务；修正配置后再选择菜单 6。"
+                fi
+            fi
+            main_menu
+            ;;
         --check) check_all ;;
         --list) show_records ;;
         --add)
