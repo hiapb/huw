@@ -17,6 +17,7 @@ BIN_PATH="${HUAWEI_DNS_GUARD_BIN_PATH:-/usr/local/sbin/${APP}}"
 SERVICE_NAME="${APP}"
 SERVICE_FILE="${HUAWEI_DNS_GUARD_SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAME}.service}"
 SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+SCRIPT_URL="${HUAWEI_DNS_GUARD_SCRIPT_URL:-https://raw.githubusercontent.com/hiapb/huw/main/install.sh}"
 
 DEFAULT_TTL=300
 DEFAULT_INTERVAL=300
@@ -876,6 +877,7 @@ install_dependencies() {
     command -v python3 >/dev/null 2>&1 || packages+=(python3)
     command -v ping >/dev/null 2>&1 || packages+=(iputils-ping)
     command -v flock >/dev/null 2>&1 || packages+=(util-linux)
+    command -v curl >/dev/null 2>&1 || packages+=(curl)
     ((${#packages[@]} == 0)) && return 0
 
     info "正在安装依赖：${packages[*]}"
@@ -883,9 +885,9 @@ install_dependencies() {
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates "${packages[@]}"
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y ca-certificates python3 iputils util-linux
+        dnf install -y ca-certificates python3 iputils util-linux curl
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y ca-certificates python3 iputils util-linux
+        yum install -y ca-certificates python3 iputils util-linux curl
     else
         fail "未找到 apt-get、dnf 或 yum，请手动安装：python3、iputils-ping、util-linux、ca-certificates。"
         return 1
@@ -899,17 +901,31 @@ install_service() {
         fail "当前系统没有 systemd，无法安装定时服务。仍可用菜单手动检测。"
         return 1
     }
-    if [[ ! -f "$SELF_PATH" ]]; then
-        fail "当前运行方式无法读取脚本自身，请把 huwei.sh 保存到本机后再运行。"
-        return 1
-    fi
-
     ensure_dirs
-    if [[ "$(readlink -f "$SELF_PATH" 2>/dev/null || printf '%s' "$SELF_PATH")" != \
-          "$(readlink -f "$BIN_PATH" 2>/dev/null || printf '%s' "$BIN_PATH")" ]]; then
-        install -m 755 "$SELF_PATH" "$BIN_PATH"
+    if [[ -f "$SELF_PATH" ]]; then
+        if [[ "$(readlink -f "$SELF_PATH" 2>/dev/null || printf '%s' "$SELF_PATH")" != \
+              "$(readlink -f "$BIN_PATH" 2>/dev/null || printf '%s' "$BIN_PATH")" ]]; then
+            install -m 755 "$SELF_PATH" "$BIN_PATH"
+        else
+            chmod 755 "$BIN_PATH"
+        fi
     else
-        chmod 755 "$BIN_PATH"
+        # bash <(curl ...) gives us a pipe, so download a persistent copy for
+        # systemd instead of trying to copy the already-consumed pipe.
+        local downloaded_script
+        downloaded_script="$(mktemp "${STATE_DIR}/script.XXXXXX")"
+        if ! curl -fL --retry 3 --connect-timeout 10 "$SCRIPT_URL" -o "$downloaded_script"; then
+            rm -f -- "$downloaded_script"
+            fail "无法从 ${SCRIPT_URL} 下载脚本自身。"
+            return 1
+        fi
+        if ! grep -q 'Huawei Cloud DNS IP guard' "$downloaded_script"; then
+            rm -f -- "$downloaded_script"
+            fail "下载到的内容不是 huwei.sh，未安装服务。"
+            return 1
+        fi
+        install -m 755 "$downloaded_script" "$BIN_PATH"
+        rm -f -- "$downloaded_script"
     fi
 
     cat > "$SERVICE_FILE" <<EOF
@@ -935,6 +951,32 @@ EOF
     systemctl restart "$SERVICE_NAME"
     ok "定时检测已启动，检测间隔 ${INTERVAL} 秒。"
     info "服务状态：systemctl status ${SERVICE_NAME}"
+}
+
+update_script() {
+    local downloaded_script
+    install_dependencies || return 1
+    ensure_dirs
+    downloaded_script="$(mktemp "${STATE_DIR}/update.XXXXXX")"
+    if ! curl -fL --retry 3 --connect-timeout 10 "$SCRIPT_URL" -o "$downloaded_script"; then
+        rm -f -- "$downloaded_script"
+        fail "下载更新失败：${SCRIPT_URL}"
+        return 1
+    fi
+    if ! grep -q 'Huawei Cloud DNS IP guard' "$downloaded_script"; then
+        rm -f -- "$downloaded_script"
+        fail "下载内容不是 huwei.sh，已取消更新。"
+        return 1
+    fi
+    install -m 755 "$downloaded_script" "$BIN_PATH"
+    rm -f -- "$downloaded_script"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE_NAME"; then
+        systemctl restart "$SERVICE_NAME"
+        ok "脚本已更新，后台定时服务已重启。"
+    else
+        ok "脚本已更新到 ${BIN_PATH}。下次启动菜单时生效。"
+    fi
+    exec "$BIN_PATH"
 }
 
 stop_service() {
@@ -984,7 +1026,7 @@ main_menu() {
     while true; do
         show_menu_header
         printf '%s\n' \
-            '  1) 首次配置 / 更新华为云 AK/SK、域名和检测规则' \
+            '  1) 配置华为云 AK/SK、域名和检测规则' \
             '  2) 批量添加 IP 到域名解析' \
             '  3) 查看当前域名解析 IP' \
             '  4) 立即检测一轮并删除失效 IP' \
@@ -992,6 +1034,7 @@ main_menu() {
             '  6) 启动/更新定时检测服务' \
             '  7) 停止定时检测服务' \
             '  8) 查看检测日志' \
+            '  9) 更新脚本' \
             '  0) 退出'
         printf '\n请选择: '
         IFS= read -r choice || choice=0
@@ -1004,6 +1047,7 @@ main_menu() {
             6) install_service; pause_menu ;;
             7) stop_service; pause_menu ;;
             8) show_logs; pause_menu ;;
+            9) update_script; pause_menu ;;
             0) exit 0 ;;
             *) warn "无效选项。"; pause_menu ;;
         esac
