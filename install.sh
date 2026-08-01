@@ -17,8 +17,8 @@ SERVICE_FILE="${HUAWEI_DNS_GUARD_SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAM
 SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 SCRIPT_URL="${HUAWEI_DNS_GUARD_SCRIPT_URL:-https://raw.githubusercontent.com/hiapb/huw/main/install.sh}"
 
-DEFAULT_TTL=300
-DEFAULT_INTERVAL=300
+DEFAULT_TTL=1
+DEFAULT_INTERVAL=30
 DEFAULT_PING_COUNT=3
 DEFAULT_PING_TIMEOUT=2
 DEFAULT_CHECK_ROUNDS=3
@@ -96,9 +96,9 @@ prompt_secret() {
 confirm() {
     local label="$1" default="${2:-n}" answer
     if [[ "$default" == "y" ]]; then
-        printf '%s [回车=是，n=否]: ' "$label" >&2
+        printf '%s [Y/n，默认是]: ' "$label" >&2
     else
-        printf '%s [y=是，回车=否]: ' "$label" >&2
+        printf '%s [y/N，默认否]: ' "$label" >&2
     fi
     IFS= read -r answer || true
     answer="${answer:-$default}"
@@ -935,8 +935,12 @@ select_task() {
     while IFS=$'\t' read -r id name domain version enabled account ddns; do
         [[ -n "$id" ]] || continue
         ids+=("$id"); names+=("$name")
-        printf '  %d. %s | %s | %s | %s | 账号: %s | DDNS: %s\n' \
-            "$index" "$name" "$domain" "$version" "$enabled" "$account" "$ddns"
+        printf '\n  %d. %s\n' "$index" "$name"
+        printf '     解析域名：%s\n' "$domain"
+        printf '     记录类型：%s\n' "$version"
+        printf '     绑定账号：%s\n' "$account"
+        printf '     运行状态：%s\n' "$enabled"
+        printf '     DDNS 来源：%s 个\n' "$ddns"
         ((index++))
     done < <(config_command task-list)
     ((${#ids[@]} > 0)) || { warn "尚未创建任务。"; return 1; }
@@ -1043,9 +1047,14 @@ add_task() {
         fail "域名格式无效。"
     done
     while true; do
-        version="$(prompt "IP 类型（4 或 6）" "4")"
-        [[ "$version" == 4 || "$version" == 6 ]] && break
-        fail "只能输入 4 或 6。"
+        printf '  1. IPv4（A 记录）\n'
+        printf '  2. IPv6（AAAA 记录）\n'
+        version="$(prompt "请选择 IP 类型" "1")"
+        case "$version" in
+            1) version=4; break;;
+            2) version=6; break;;
+            *) fail "请输入序号 1 或 2。";;
+        esac
     done
     ttl="$(prompt_number "DNS TTL（秒）" "$DEFAULT_TTL" 1 2147483647)"
     interval="$(prompt_number "该任务检测/DDNS 同步间隔（秒）" "$DEFAULT_INTERVAL" 10 86400)"
@@ -1071,8 +1080,12 @@ list_tasks() {
     local id name domain version enabled account ddns found=0 index=1
     menu_title "DNS 任务"
     while IFS=$'\t' read -r id name domain version enabled account ddns; do
-        printf '  %d. %s | %s | %s | %s | 账号: %s | DDNS: %s\n' \
-            "$index" "$name" "$domain" "$version" "$enabled" "$account" "$ddns"
+        printf '\n  %d. %s\n' "$index" "$name"
+        printf '     解析域名：%s\n' "$domain"
+        printf '     记录类型：%s\n' "$version"
+        printf '     绑定账号：%s\n' "$account"
+        printf '     运行状态：%s\n' "$enabled"
+        printf '     DDNS 来源：%s 个\n' "$ddns"
         found=1; ((index++))
     done < <(config_command task-list)
     ((found == 1)) || printf '暂无任务。\n'
@@ -1258,12 +1271,14 @@ edit_task_settings() {
                 if ((DDNS_COUNT > 0)); then
                     fail "请先在 DDNS 域名管理中解除全部绑定，再切换 IP 类型。"
                 else
-                    value="$(prompt "IP 类型（4 或 6）" "$IP_VERSION")"
-                    if [[ "$value" == 4 || "$value" == 6 ]]; then
-                        config_command task-set "$task_id" ip_version "$value"
-                    else
-                        fail "类型无效。"
-                    fi
+                    printf '  1. IPv4（A 记录）\n'
+                    printf '  2. IPv6（AAAA 记录）\n'
+                    value="$(prompt "请选择 IP 类型" "$([[ "$IP_VERSION" == 4 ]] && printf 1 || printf 2)")"
+                    case "$value" in
+                        1) config_command task-set "$task_id" ip_version 4;;
+                        2) config_command task-set "$task_id" ip_version 6;;
+                        *) fail "请输入序号 1 或 2。";;
+                    esac
                 fi;;
             5) value="$(prompt_number "TTL" "$TTL" 1 2147483647)"; config_command task-set "$task_id" ttl "$value";;
             6) value="$(prompt_number "间隔" "$INTERVAL" 10 86400)"; config_command task-set "$task_id" interval "$value";;
@@ -1390,7 +1405,7 @@ task_detail_menu() {
         printf '  任务状态: %s\n' "$([[ "$ENABLED" == 1 ]] && printf '启用' || printf '停用')"
         printf '  执行间隔: %s 秒\n' "$INTERVAL"
         printf '  DDNS 来源: %s 个\n\n' "$DDNS_COUNT"
-        menu_item 1 "查看云端记录和 IP"
+        menu_item 1 "查看解析记录"
         menu_item 2 "添加 IP"
         menu_item 3 "删除 IP"
         menu_item 4 "立即检测 / 同步一轮"
@@ -1416,7 +1431,7 @@ task_menu() {
     local choice
     while true; do
         menu_title "DNS 任务管理"
-        menu_item 1 "查看任务"
+        menu_item 1 "任务总览"
         menu_item 2 "新建 IPv4 / IPv6 任务"
         menu_item 3 "选择任务进行管理"
         menu_item 0 "返回"
