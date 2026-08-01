@@ -616,6 +616,16 @@ load_task() {
     [[ -n "$DOMAIN" ]]
 }
 
+task_active_count() {
+    local task_id="$1" records count
+    if records="$(dns_command "$task_id" records 2>/dev/null)"; then
+        count="$(awk 'NF { total++ } END { print total + 0 }' <<< "$records")"
+        printf '%s\n' "$count"
+    else
+        printf '读取失败\n'
+    fi
+}
+
 # Performs Huawei Cloud SDK-HMAC-SHA256 signing, A/AAAA record management,
 # family-specific DDNS resolution and ownership-safe stale DDNS cleanup.
 dns_command() {
@@ -1081,18 +1091,20 @@ select_account() {
 
 select_task() {
     local -a ids names
-    local id name domain version enabled account ddns backup choice index=1
+    local id name domain version enabled account ddns backup active choice index=1
     ids=(); names=()
     menu_title "选择任务"
     while IFS=$'\t' read -r id name domain version enabled account ddns backup; do
         [[ -n "$id" ]] || continue
         ids+=("$id"); names+=("$name")
+        active="$(task_active_count "$id")"
         printf '\n  %d. %s\n' "$index" "$name"
         printf '     解析域名：%s\n' "$domain"
         printf '     记录类型：%s\n' "$version"
         printf '     绑定账号：%s\n' "$account"
         printf '     运行状态：%s\n' "$enabled"
         printf '     DDNS 来源：%s 个\n' "$ddns"
+        printf '     当前解析：%s 个\n' "$active"
         printf '     备用解析：%s 个\n' "$backup"
         ((index++))
     done < <(config_command task-list)
@@ -1230,15 +1242,17 @@ add_task() {
 }
 
 list_tasks() {
-    local id name domain version enabled account ddns backup found=0 index=1
+    local id name domain version enabled account ddns backup active found=0 index=1
     menu_title "DNS 任务"
     while IFS=$'\t' read -r id name domain version enabled account ddns backup; do
+        active="$(task_active_count "$id")"
         printf '\n  %d. %s\n' "$index" "$name"
         printf '     解析域名：%s\n' "$domain"
         printf '     记录类型：%s\n' "$version"
         printf '     绑定账号：%s\n' "$account"
         printf '     运行状态：%s\n' "$enabled"
         printf '     DDNS 来源：%s 个\n' "$ddns"
+        printf '     当前解析：%s 个\n' "$active"
         printf '     备用解析：%s 个\n' "$backup"
         found=1; ((index++))
     done < <(config_command task-list)
@@ -1631,7 +1645,7 @@ delete_task() {
 }
 
 task_detail_menu() {
-    local task_id="$1" choice
+    local task_id="$1" choice active
     while true; do
         load_task "$task_id" || return
         menu_title "任务管理"
@@ -1642,7 +1656,9 @@ task_detail_menu() {
         printf '  任务状态: %s\n' "$([[ "$ENABLED" == 1 ]] && printf '启用' || printf '停用')"
         printf '  执行间隔: %s 秒\n' "$INTERVAL"
         printf '  DDNS 来源: %s 个\n' "$DDNS_COUNT"
-        printf '  备用解析: %s 个\n\n' "$BACKUP_COUNT" "$MAX_ACTIVE_IPS"
+        active="$(task_active_count "$TASK_ID")"
+        printf '  当前解析: %s 个（活动上限 %s 个）\n' "$active" "$MAX_ACTIVE_IPS"
+        printf '  备用解析: %s 个\n\n' "$BACKUP_COUNT"
         menu_item 1 "查看解析记录"
         menu_item 2 "添加活动解析 IP"
         menu_item 3 "删除活动解析 IP"
