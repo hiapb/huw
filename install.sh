@@ -1657,7 +1657,7 @@ task_detail_menu() {
         printf '  执行间隔: %s 秒\n' "$INTERVAL"
         printf '  DDNS 来源: %s 个\n' "$DDNS_COUNT"
         active="$(task_active_count "$TASK_ID")"
-        printf '  当前解析: %s 个（活动上限 %s 个）\n' "$active" "$MAX_ACTIVE_IPS"
+        printf '  当前解析: %s 个\n' "$active" "$MAX_ACTIVE_IPS"
         printf '  备用解析: %s 个\n\n' "$BACKUP_COUNT"
         menu_item 1 "查看解析记录"
         menu_item 2 "添加活动解析 IP"
