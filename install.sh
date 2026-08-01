@@ -974,7 +974,9 @@ def print_summary(zone, recordset):
     print(f"管理记录: {domain}  {record_type}")
     print(f"任务状态: {'启用' if task.get('enabled', True) else '停用'}")
     print(f"DDNS 来源: {len(task.get('ddns_domains', []))} 个")
-    print(f"备用解析: {len(task.get('backup_ips', []))} 个（活动上限 {MAX_ACTIVE_IPS} 个）")
+    records = current_records(recordset)
+    print(f"当前解析: {len(records)} 个（活动上限 {MAX_ACTIVE_IPS} 个）")
+    print(f"备用解析: {len(task.get('backup_ips', []))} 个")
     for source in task.get("ddns_domains", []):
         if isinstance(source, dict):
             print(f"  [{source.get('name', '')}] {source.get('domain', '')}")
@@ -983,7 +985,6 @@ def print_summary(zone, recordset):
         return
     print(f"记录状态: {recordset.get('status', 'UNKNOWN')}")
     print(f"TTL: {recordset.get('ttl', task.get('ttl', 300))} 秒")
-    records = current_records(recordset)
     print(f"活动 IP 数量: {len(records)}")
     for index, ip in enumerate(records, 1):
         print(f"  {index:>3}. {ip}")
@@ -1310,7 +1311,11 @@ backup_add_ips() {
     done
     ((${#values[@]} > 0)) || { warn "没有输入有效备用 IP。"; return 1; }
     config_command backup-add "$task_id" "${values[@]}" || return 1
-    ok "备用 IP 已添加；活动解析最多保留 ${MAX_ACTIVE_IPS} 个。"
+    if dns_command "$TASK_ID" rebalance >/dev/null 2>&1; then
+        ok "备用 IP 已添加，并已自动补入活动解析（上限 ${MAX_ACTIVE_IPS} 个）。"
+    else
+        warn "备用 IP 已添加；本次云端补位失败，将在下次任务检查时重试。"
+    fi
 }
 
 backup_remove_ips() {
@@ -1648,6 +1653,14 @@ task_detail_menu() {
     local task_id="$1" choice active
     while true; do
         load_task "$task_id" || return
+        # 打开任务时顺手补齐活动解析，备用池为空或云端暂不可用均静默跳过。
+        if [[ "$BACKUP_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+            active="$(task_active_count "$TASK_ID")"
+            if [[ "$active" =~ ^[0-9]+$ ]] && ((active < MAX_ACTIVE_IPS)); then
+                dns_command "$TASK_ID" rebalance >/dev/null 2>&1 || true
+                load_task "$task_id" || return
+            fi
+        fi
         menu_title "任务管理"
         printf '  任务名称: %s\n' "$TASK_NAME"
         printf '  解析记录: %s\n' "$DOMAIN"
@@ -1927,7 +1940,10 @@ main() {
                 for cli_ip in "${CLI_ARGS[@]}"; do
                     valid_ip_for_version "$cli_ip" "$IP_VERSION" || { fail "地址 ${cli_ip} 与任务 IPv${IP_VERSION} 不匹配。"; exit 1; }
                 done
-                config_command "backup-${local_action#backup-}" "$TASK_ID" "${CLI_ARGS[@]}"
+                config_command "backup-${local_action#backup-}" "$TASK_ID" "${CLI_ARGS[@]}" || exit 1
+                if [[ "$local_action" == "backup-add" ]]; then
+                    dns_command "$TASK_ID" rebalance || warn "备用 IP 已保存，但本次云端补位失败，将在下次任务检查时重试。"
+                fi
             fi;;
         --check)
             shift; extract_task_option "$@" || exit 1
