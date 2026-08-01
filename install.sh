@@ -14,7 +14,8 @@ LOG_FILE="${HUAWEI_DNS_GUARD_LOG_FILE:-/var/log/${APP}.log}"
 BIN_PATH="${HUAWEI_DNS_GUARD_BIN_PATH:-/usr/local/sbin/${APP}}"
 SERVICE_NAME="${APP}"
 SERVICE_FILE="${HUAWEI_DNS_GUARD_SERVICE_FILE:-/etc/systemd/system/${SERVICE_NAME}.service}"
-SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+SELF_PATH="$(readlink -f "$SCRIPT_PATH" 2>/dev/null || printf '%s' "$SCRIPT_PATH")"
 SCRIPT_URL="${HUAWEI_DNS_GUARD_SCRIPT_URL:-https://raw.githubusercontent.com/hiapb/huw/main/install.sh}"
 
 DEFAULT_TTL=1
@@ -24,6 +25,7 @@ DEFAULT_PING_TIMEOUT=2
 DEFAULT_CHECK_ROUNDS=3
 DEFAULT_ROUND_DELAY=2
 DEFAULT_MAX_PARALLEL=20
+MAX_ACTIVE_IPS=50
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     RESET=$'\033[0m'; BOLD=$'\033[1m'; GREEN=$'\033[0;32m'
@@ -151,6 +153,7 @@ config_command() {
     shift
     python3 - "$CONFIG_FILE" "$action" "$@" <<'PY'
 import json
+import ipaddress
 import os
 import re
 import sys
@@ -170,7 +173,7 @@ def concise_exception(exc_type, exc, traceback):
 sys.excepthook = concise_exception
 
 DEFAULTS = {
-    "ttl": 300, "interval": 300, "ping_count": 3, "ping_timeout": 2,
+    "ttl": 1, "interval": 30, "ping_count": 3, "ping_timeout": 2,
     "check_rounds": 3, "round_delay": 2, "max_parallel": 20,
 }
 
@@ -187,6 +190,23 @@ def read_config():
 
 def clean_text(value):
     return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+
+def normalize_ip_values(values):
+    result = []
+    seen = set()
+    for value in values:
+        value = clean_text(value)
+        if not value:
+            continue
+        try:
+            value = str(ipaddress.ip_address(value))
+        except ValueError:
+            pass
+        if value not in seen:
+            result.append(value)
+            seen.add(value)
+    return result
 
 
 def normalize(data):
@@ -248,6 +268,10 @@ def normalize(data):
             ddns_items.append({"id": ddns_id, "name": ddns_name or ddns_domain, "domain": ddns_domain})
             seen_domains.add(ddns_domain)
         task["ddns_domains"] = sorted(ddns_items, key=lambda item: (item["name"], item["domain"]))
+        backup_items = task.get("backup_ips", [])
+        if not isinstance(backup_items, list):
+            backup_items = []
+        task["backup_ips"] = normalize_ip_values(backup_items)
         for key, default in DEFAULTS.items():
             task[key] = int(task.get(key, default))
     return data, migrated
@@ -316,6 +340,14 @@ def validate(data):
             ddns_names.add(normalized_name)
             if not domain_pattern.fullmatch(ddns["domain"]):
                 raise RuntimeError(f"DDNS 域名无效: {ddns['domain']}")
+        try:
+            backup_ips = [str(ipaddress.ip_address(value)) for value in task["backup_ips"]]
+        except ValueError as error:
+            raise RuntimeError(f"任务 {task['name']} 的备用 IP 无效") from error
+        if backup_ips != task["backup_ips"] or len(set(backup_ips)) != len(backup_ips):
+            raise RuntimeError(f"任务 {task['name']} 的备用 IP 存在重复或格式不规范")
+        if any(ipaddress.ip_address(value).version != task["ip_version"] for value in backup_ips):
+            raise RuntimeError(f"任务 {task['name']} 的备用 IP 类型与 IPv{task['ip_version']} 不匹配")
         for key, (minimum, maximum) in ranges.items():
             if not minimum <= task[key] <= maximum:
                 raise RuntimeError(f"任务 {task['name']} 的 {key} 超出范围")
@@ -394,9 +426,15 @@ elif action == "task-list":
     accounts = {a["id"]: a["name"] for a in data["accounts"]}
     for task in data["tasks"]:
         record_type = "A" if task["ip_version"] == 4 else "AAAA"
-        print("\t".join((task["id"], task["name"], task["domain"],
-            f"{record_type} / IPv{task['ip_version']}", "启用" if task["enabled"] else "停用",
-            accounts.get(task["account_id"], task["account_id"]), str(len(task["ddns_domains"])))))
+        fields = (
+            task["id"], task["name"], task["domain"],
+            f"{record_type} / IPv{task['ip_version']}",
+            "启用" if task["enabled"] else "停用",
+            accounts.get(task["account_id"], task["account_id"]),
+            str(len(task["ddns_domains"])),
+            str(len(task.get("backup_ips", []))),
+        )
+        print("\t".join(fields))
 elif action == "task-show":
     task = find_task(data, args[0])
     account = find_account(data, task["account_id"])
@@ -404,6 +442,8 @@ elif action == "task-show":
     values["account_name"] = account["name"]
     values["record_type"] = "A" if task["ip_version"] == 4 else "AAAA"
     values["ddns_count"] = len(task["ddns_domains"])
+    values["backup_ips"] = ", ".join(task.get("backup_ips", []))
+    values["backup_count"] = len(task.get("backup_ips", []))
     for key, value in values.items():
         if isinstance(value, bool):
             value = "1" if value else "0"
@@ -420,7 +460,7 @@ elif action == "task-add":
         "id": task_id, "name": clean_text(name), "account_id": account_id,
         "domain": clean_text(domain).rstrip(".").lower(), "ip_version": int(version),
         "enabled": True, "health_enabled": True, "prune_stale_ddns": True,
-        "ddns_domains": [], "ttl": int(ttl), "interval": int(interval),
+        "ddns_domains": [], "backup_ips": [], "ttl": int(ttl), "interval": int(interval),
         "ping_count": int(ping_count), "ping_timeout": int(ping_timeout),
         "check_rounds": int(check_rounds), "round_delay": int(round_delay),
         "max_parallel": int(max_parallel),
@@ -431,19 +471,24 @@ elif action == "task-set":
     task_id, field, value = args
     task = find_task(data, task_id)
     allowed = {"name", "account_id", "domain", "ip_version", "enabled", "health_enabled",
-               "prune_stale_ddns", *DEFAULTS.keys()}
+               "prune_stale_ddns", "backup_ips", *DEFAULTS.keys()}
     if field not in allowed:
         raise RuntimeError("不允许修改该字段")
     if field == "account_id":
         find_account(data, value)
     if field in ("ip_version", *DEFAULTS.keys()):
         value = int(value)
-        if field == "ip_version" and value != task["ip_version"] and task["ddns_domains"]:
-            raise RuntimeError("请先解除该任务的全部 DDNS 绑定，再切换 IP 类型")
+        if field == "ip_version" and value != task["ip_version"]:
+            if task["ddns_domains"]:
+                raise RuntimeError("请先解除该任务的全部 DDNS 绑定，再切换 IP 类型")
+            if task.get("backup_ips"):
+                raise RuntimeError("请先清空该任务的备用 IP，再切换 IP 类型")
     elif field in ("enabled", "health_enabled", "prune_stale_ddns"):
         value = value.lower() in ("1", "true", "yes", "y")
     elif field == "domain":
         value = clean_text(value).rstrip(".").lower()
+    elif field == "backup_ips":
+        value = normalize_ip_values(value.split(","))
     else:
         value = clean_text(value)
     task[field] = value
@@ -455,6 +500,21 @@ elif action == "task-delete":
 elif action == "ddns-list":
     for item in find_task(data, args[0])["ddns_domains"]:
         print(f"{item['id']}\t{item['name']}\t{item['domain']}")
+elif action == "backup-list":
+    for value in find_task(data, args[0])["backup_ips"]:
+        print(value)
+elif action == "backup-add":
+    task_id = args[0]
+    task = find_task(data, task_id)
+    values = normalize_ip_values(args[1:])
+    task["backup_ips"] = normalize_ip_values(task["backup_ips"] + values)
+    mutated = True
+elif action == "backup-remove":
+    task_id = args[0]
+    task = find_task(data, task_id)
+    removals = set(normalize_ip_values(args[1:]))
+    task["backup_ips"] = [value for value in task["backup_ips"] if value not in removals]
+    mutated = True
 elif action == "ddns-add":
     task_id, ddns_id, name, domain = args
     task = find_task(data, task_id)
@@ -539,7 +599,7 @@ load_task() {
     TTL="$DEFAULT_TTL"; INTERVAL="$DEFAULT_INTERVAL"; PING_COUNT="$DEFAULT_PING_COUNT"
     PING_TIMEOUT="$DEFAULT_PING_TIMEOUT"; CHECK_ROUNDS="$DEFAULT_CHECK_ROUNDS"
     ROUND_DELAY="$DEFAULT_ROUND_DELAY"; MAX_PARALLEL="$DEFAULT_MAX_PARALLEL"
-    DDNS_DOMAINS=""; DDNS_COUNT=0
+    DDNS_DOMAINS=""; DDNS_COUNT=0; BACKUP_IPS=""; BACKUP_COUNT=0
     while IFS=$'\t' read -r key value; do
         case "$key" in
             id) TASK_ID="$value";; name) TASK_NAME="$value";; account_id) ACCOUNT_ID="$value";;
@@ -550,6 +610,7 @@ load_task() {
             check_rounds) CHECK_ROUNDS="$value";; round_delay) ROUND_DELAY="$value";;
             max_parallel) MAX_PARALLEL="$value";; ddns_domains) DDNS_DOMAINS="$value";;
             ddns_count) DDNS_COUNT="$value";;
+            backup_ips) BACKUP_IPS="$value";; backup_count) BACKUP_COUNT="$value";;
         esac
     done < <(config_command task-show "$TASK_ID") || return 1
     [[ -n "$DOMAIN" ]]
@@ -576,6 +637,7 @@ import urllib.request
 
 CONFIG_PATH, STATE_DIR, TASK_ID, ACTION = sys.argv[1:5]
 ARGS = sys.argv[5:]
+MAX_ACTIVE_IPS = 50
 
 
 def normalize_name(value):
@@ -584,10 +646,12 @@ def normalize_name(value):
 
 with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
     config = json.load(handle)
-task = next((t for t in config.get("tasks", []) if t.get("id") == TASK_ID), None)
+task = next((t for t in config.get("tasks", [])
+             if t.get("id") == TASK_ID or t.get("name") == TASK_ID), None)
 if not task:
     print(f"错误：找不到任务 {TASK_ID}", file=sys.stderr)
     raise SystemExit(1)
+TASK_ID = str(task.get("id"))
 account = next((a for a in config.get("accounts", []) if a.get("id") == task.get("account_id")), None)
 if not account or not account.get("ak") or not account.get("sk"):
     print("错误：任务绑定的华为云账号不存在或缺少 AK/SK", file=sys.stderr)
@@ -790,6 +854,70 @@ def save_ddns_state(value):
             pass
 
 
+def save_config(value):
+    directory = os.path.dirname(CONFIG_PATH)
+    fd, temp = tempfile.mkstemp(prefix=".config.", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.replace(temp, CONFIG_PATH)
+    finally:
+        try:
+            os.unlink(temp)
+        except FileNotFoundError:
+            pass
+
+
+def backup_records():
+    values = []
+    for value in task.get("backup_ips", []):
+        try:
+            values.append(str(address_class(str(value).strip())))
+        except ipaddress.AddressValueError:
+            pass
+    return clean_records(values)
+
+
+def allocate_records(active, candidates):
+    def ordered(values):
+        result = []
+        seen = set()
+        for value in values:
+            try:
+                normalized = str(address_class(str(value).strip()))
+            except ipaddress.AddressValueError:
+                continue
+            if normalized not in seen:
+                result.append(normalized)
+                seen.add(normalized)
+        return result
+    active = ordered(active)
+    candidates = ordered(candidates)
+    selected = active[:MAX_ACTIVE_IPS]
+    selected_set = set(selected)
+    for value in candidates:
+        if len(selected) >= MAX_ACTIVE_IPS:
+            break
+        if value not in selected_set:
+            selected.append(value)
+            selected_set.add(value)
+    overflow = active[MAX_ACTIVE_IPS:]
+    overflow.extend(value for value in candidates if value not in selected_set and value not in overflow)
+    return selected, overflow
+
+
+def persist_backup(values):
+    values = clean_records(values)
+    task["backup_ips"] = values
+    for item in config.get("tasks", []):
+        if item.get("id") == TASK_ID:
+            item["backup_ips"] = values
+            break
+    save_config(config)
+
+
 def sync_ddns(zone, recordset):
     configured = [
         normalize_name(item.get("domain", "")) if isinstance(item, dict) else normalize_name(item)
@@ -808,20 +936,23 @@ def sync_ddns(zone, recordset):
                 sources[name] = []
     desired = set(clean_records(v for values in sources.values() for v in values))
     existing = set(current_records(recordset))
+    configured_backup = set(backup_records())
     old_owned = set(clean_records(state.get("owned", [])))
     stale = old_owned - desired if task.get("prune_stale_ddns", True) else set()
     additions = desired - existing
-    merged = clean_records((existing - stale) | desired)
-    if merged != clean_records(existing):
-        if merged:
-            create_or_update(zone, recordset, merged, int(task.get("ttl", 300)))
+    candidate_active = clean_records((existing - stale) | desired)
+    active, overflow = allocate_records(candidate_active, candidate_active + list(configured_backup))
+    if active != clean_records(existing):
+        if active:
+            create_or_update(zone, recordset, active, int(task.get("ttl", 300)))
         elif recordset:
             api_request("DELETE", f"/v2/zones/{zone['id']}/recordsets/{recordset['id']}")
+    persist_backup(overflow)
     owned = (old_owned - stale) | additions
     owned &= desired
     save_ddns_state({"sources": sources, "owned": clean_records(owned),
                      "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
-    print(f"DDNS 同步：来源 {len(configured)} 个，新增 {len(additions)}，清理旧地址 {len(stale)}，当前来源地址 {len(desired)}。")
+    print(f"DDNS 同步：来源 {len(configured)} 个，新增 {len(additions)}，清理旧地址 {len(stale)}，活动 {len(active)} 个，备用 {len(overflow)} 个。")
     for message in errors:
         print(f"注意：{message}；已保留该来源上次的地址。", file=sys.stderr)
 
@@ -833,6 +964,7 @@ def print_summary(zone, recordset):
     print(f"管理记录: {domain}  {record_type}")
     print(f"任务状态: {'启用' if task.get('enabled', True) else '停用'}")
     print(f"DDNS 来源: {len(task.get('ddns_domains', []))} 个")
+    print(f"备用解析: {len(task.get('backup_ips', []))} 个（活动上限 {MAX_ACTIVE_IPS} 个）")
     for source in task.get("ddns_domains", []):
         if isinstance(source, dict):
             print(f"  [{source.get('name', '')}] {source.get('domain', '')}")
@@ -842,7 +974,7 @@ def print_summary(zone, recordset):
     print(f"记录状态: {recordset.get('status', 'UNKNOWN')}")
     print(f"TTL: {recordset.get('ttl', task.get('ttl', 300))} 秒")
     records = current_records(recordset)
-    print(f"IP 数量: {len(records)}")
+    print(f"活动 IP 数量: {len(records)}")
     for index, ip in enumerate(records, 1):
         print(f"  {index:>3}. {ip}")
 
@@ -863,20 +995,40 @@ def main():
     elif ACTION == "add":
         additions = clean_records(ARGS)
         existing = current_records(recordset)
-        merged = clean_records(existing + additions)
-        create_or_update(zone, recordset, merged, int(task.get("ttl", 300)))
-        print(f"已写入 {record_type} 记录：新增 {len(set(merged) - set(existing))} 个，当前共 {len(merged)} 个 IP。")
+        backup = backup_records()
+        active, overflow = allocate_records(existing, existing + additions + backup)
+        if active != existing:
+            create_or_update(zone, recordset, active, int(task.get("ttl", 300)))
+        persist_backup(overflow)
+        print(f"已写入 {record_type} 记录：活动 {len(active)} 个，备用 {len(overflow)} 个。")
     elif ACTION == "remove":
         removals = set(clean_records(ARGS))
         existing = current_records(recordset)
+        backup = backup_records()
         remaining = [ip for ip in existing if ip not in removals]
-        removed = len(existing) - len(remaining)
-        if recordset and removed:
-            if remaining:
-                create_or_update(zone, recordset, remaining, int(recordset.get("ttl", task.get("ttl", 300))))
-            else:
+        backup_remaining = [ip for ip in backup if ip not in removals]
+        active, overflow = allocate_records(remaining, backup_remaining)
+        removed = len(existing) - len(active)
+        if active != existing:
+            if active:
+                create_or_update(zone, recordset, active,
+                                 int(recordset.get("ttl", task.get("ttl", 300))) if recordset
+                                 else int(task.get("ttl", 300)))
+            elif recordset:
                 api_request("DELETE", f"/v2/zones/{zone['id']}/recordsets/{recordset['id']}")
-        print(f"已删除 {removed} 个 IP，剩余 {len(remaining)} 个。")
+        persist_backup(overflow)
+        print(f"已处理删除：活动 {len(active)} 个，备用 {len(overflow)} 个。")
+    elif ACTION == "rebalance":
+        existing = current_records(recordset)
+        backup = backup_records()
+        active, overflow = allocate_records(existing, backup)
+        if active != existing:
+            if active:
+                create_or_update(zone, recordset, active, int(task.get("ttl", 300)))
+            elif recordset:
+                api_request("DELETE", f"/v2/zones/{zone['id']}/recordsets/{recordset['id']}")
+        persist_backup(overflow)
+        print(f"解析池整理完成：活动 {len(active)} 个，备用 {len(overflow)} 个。")
     elif ACTION == "sync-ddns":
         sync_ddns(zone, recordset)
     else:
@@ -929,10 +1081,10 @@ select_account() {
 
 select_task() {
     local -a ids names
-    local id name domain version enabled account ddns choice index=1
+    local id name domain version enabled account ddns backup choice index=1
     ids=(); names=()
     menu_title "选择任务"
-    while IFS=$'\t' read -r id name domain version enabled account ddns; do
+    while IFS=$'\t' read -r id name domain version enabled account ddns backup; do
         [[ -n "$id" ]] || continue
         ids+=("$id"); names+=("$name")
         printf '\n  %d. %s\n' "$index" "$name"
@@ -941,6 +1093,7 @@ select_task() {
         printf '     绑定账号：%s\n' "$account"
         printf '     运行状态：%s\n' "$enabled"
         printf '     DDNS 来源：%s 个\n' "$ddns"
+        printf '     备用解析：%s 个\n' "$backup"
         ((index++))
     done < <(config_command task-list)
     ((${#ids[@]} > 0)) || { warn "尚未创建任务。"; return 1; }
@@ -1077,15 +1230,16 @@ add_task() {
 }
 
 list_tasks() {
-    local id name domain version enabled account ddns found=0 index=1
+    local id name domain version enabled account ddns backup found=0 index=1
     menu_title "DNS 任务"
-    while IFS=$'\t' read -r id name domain version enabled account ddns; do
+    while IFS=$'\t' read -r id name domain version enabled account ddns backup; do
         printf '\n  %d. %s\n' "$index" "$name"
         printf '     解析域名：%s\n' "$domain"
         printf '     记录类型：%s\n' "$version"
         printf '     绑定账号：%s\n' "$account"
         printf '     运行状态：%s\n' "$enabled"
         printf '     DDNS 来源：%s 个\n' "$ddns"
+        printf '     备用解析：%s 个\n' "$backup"
         found=1; ((index++))
     done < <(config_command task-list)
     ((found == 1)) || printf '暂无任务。\n'
@@ -1113,6 +1267,73 @@ task_add_ips() {
     collect_ips "$IP_VERSION" || return 1
     info "正在向 ${DOMAIN} 的 ${RECORD_TYPE} 记录添加 ${#INPUT_IPS[@]} 个地址..."
     dns_command "$TASK_ID" add "${INPUT_IPS[@]}" && ok "IP 添加完成。"
+}
+
+list_backup_ips() {
+    local task_id="$1" ip found=0 index=1
+    menu_title "备用解析 IP"
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] || continue
+        printf '  %d. %s\n' "$index" "$ip"
+        found=1; ((index++))
+    done < <(config_command backup-list "$task_id")
+    ((found == 1)) || printf '  暂无备用 IP。\n'
+}
+
+backup_add_ips() {
+    local task_id="$1" line ip
+    load_task "$task_id" || return 1
+    printf '请输入备用 IPv%s，一行一个；空行或单独一行 . 结束：\n' "$IP_VERSION"
+    local -a values=()
+    while IFS= read -r line; do
+        line="$(trim "${line//$'\r'/}")"
+        [[ -n "$line" && "$line" != "." ]] || break
+        if valid_ip_for_version "$line" "$IP_VERSION"; then
+            values+=("$line")
+        else
+            warn "已跳过无效或类型不匹配的地址：$line"
+        fi
+    done
+    ((${#values[@]} > 0)) || { warn "没有输入有效备用 IP。"; return 1; }
+    config_command backup-add "$task_id" "${values[@]}" || return 1
+    ok "备用 IP 已添加；活动解析最多保留 ${MAX_ACTIVE_IPS} 个。"
+}
+
+backup_remove_ips() {
+    local task_id="$1" line ip
+    load_task "$task_id" || return 1
+    printf '请输入要删除的备用 IPv%s，一行一个；空行或单独一行 . 结束：\n' "$IP_VERSION"
+    local -a values=()
+    while IFS= read -r line; do
+        line="$(trim "${line//$'\r'/}")"
+        [[ -n "$line" && "$line" != "." ]] || break
+        valid_ip_for_version "$line" "$IP_VERSION" && values+=("$line") || warn "已跳过无效地址：$line"
+    done
+    ((${#values[@]} > 0)) || { warn "没有输入有效 IP。"; return 1; }
+    config_command backup-remove "$task_id" "${values[@]}" || return 1
+    ok "备用 IP 已删除。"
+}
+
+backup_menu() {
+    local task_id="$1" choice
+    while true; do
+        load_task "$task_id" || return 1
+        menu_title "备用解析 IP"
+        printf '  任务名称: %s\n' "$TASK_NAME"
+        printf '  活动解析上限: %s 个\n' "$MAX_ACTIVE_IPS"
+        printf '  当前备用数量: %s 个\n\n' "$BACKUP_COUNT"
+        menu_item 1 "查看备用 IP"
+        menu_item 2 "添加备用 IP"
+        menu_item 3 "删除备用 IP"
+        menu_item 0 "返回"
+        choice="$(prompt "请选择" "0")"
+        case "$choice" in
+            1) list_backup_ips "$task_id"; pause_menu;;
+            2) backup_add_ips "$task_id"; pause_menu;;
+            3) backup_remove_ips "$task_id"; pause_menu;;
+            0) return;; *) warn "无效选项。";;
+        esac
+    done
 }
 
 task_remove_ips() {
@@ -1161,7 +1382,8 @@ list_ddns() {
 }
 
 ddns_edit() {
-    local task_id="$1" -a ids names domains
+    local task_id="$1"
+    local -a ids names domains
     local id name domain choice new_name new_domain index=1
     ids=(); names=(); domains=()
     menu_title "选择要修改的 DDNS 来源"
@@ -1195,7 +1417,8 @@ ddns_edit() {
 }
 
 ddns_remove() {
-    local task_id="$1" -a ids names domains
+    local task_id="$1"
+    local -a ids names domains
     local id name domain choice index=1
     ids=(); names=(); domains=()
     menu_title "选择要删除的 DDNS 来源"
@@ -1264,9 +1487,9 @@ edit_task_settings() {
         menu_item 0 "返回"
         choice="$(prompt "请选择设置项" "0")"
         case "$choice" in
-            1) value="$(trim "$(prompt "新任务名称" "$TASK_NAME")")"; [[ -n "$value" ]] && config_command task-set "$task_id" name "$value";;
-            2) select_account && config_command task-set "$task_id" account_id "$SELECTED_ACCOUNT_ID";;
-            3) value="$(trim "$(prompt "新完整域名" "$DOMAIN")")"; valid_domain "$value" && config_command task-set "$task_id" domain "$value" || fail "域名无效。";;
+            1) value="$(trim "$(prompt "新任务名称" "$TASK_NAME")")"; [[ -n "$value" ]] && config_command task-set "$task_id" name "$value" || fail "任务名称不能为空或保存失败。";;
+            2) if select_account; then config_command task-set "$task_id" account_id "$SELECTED_ACCOUNT_ID" || fail "绑定账号保存失败。"; fi;;
+            3) value="$(trim "$(prompt "新完整域名" "$DOMAIN")")"; if valid_domain "$value"; then config_command task-set "$task_id" domain "$value" || fail "域名保存失败。"; else fail "域名无效。"; fi;;
             4)
                 if ((DDNS_COUNT > 0)); then
                     fail "请先在 DDNS 域名管理中解除全部绑定，再切换 IP 类型。"
@@ -1275,20 +1498,20 @@ edit_task_settings() {
                     printf '  2. IPv6（AAAA 记录）\n'
                     value="$(prompt "请选择 IP 类型" "$([[ "$IP_VERSION" == 4 ]] && printf 1 || printf 2)")"
                     case "$value" in
-                        1) config_command task-set "$task_id" ip_version 4;;
-                        2) config_command task-set "$task_id" ip_version 6;;
+                        1) config_command task-set "$task_id" ip_version 4 || fail "IPv4 类型保存失败。";;
+                        2) config_command task-set "$task_id" ip_version 6 || fail "IPv6 类型保存失败。";;
                         *) fail "请输入序号 1 或 2。";;
                     esac
                 fi;;
-            5) value="$(prompt_number "TTL" "$TTL" 1 2147483647)"; config_command task-set "$task_id" ttl "$value";;
-            6) value="$(prompt_number "间隔" "$INTERVAL" 10 86400)"; config_command task-set "$task_id" interval "$value";;
-            7) value="$(prompt_number "ping 次数" "$PING_COUNT" 1 10)"; config_command task-set "$task_id" ping_count "$value";;
-            8) value="$(prompt_number "检测轮数" "$CHECK_ROUNDS" 1 10)"; config_command task-set "$task_id" check_rounds "$value";;
-            9) value="$(prompt_number "ping 超时" "$PING_TIMEOUT" 1 30)"; config_command task-set "$task_id" ping_timeout "$value";;
-            10) value="$(prompt_number "轮次等待" "$ROUND_DELAY" 0 60)"; config_command task-set "$task_id" round_delay "$value";;
-            11) value="$(prompt_number "最大并发" "$MAX_PARALLEL" 1 100)"; config_command task-set "$task_id" max_parallel "$value";;
-            12) config_command task-set "$task_id" health_enabled "$([[ "$HEALTH_ENABLED" == 1 ]] && printf 0 || printf 1)";;
-            13) config_command task-set "$task_id" prune_stale_ddns "$([[ "$PRUNE_STALE_DDNS" == 1 ]] && printf 0 || printf 1)";;
+            5) value="$(prompt_number "TTL" "$TTL" 1 2147483647)"; config_command task-set "$task_id" ttl "$value" || fail "TTL 保存失败。";;
+            6) value="$(prompt_number "间隔" "$INTERVAL" 10 86400)"; config_command task-set "$task_id" interval "$value" || fail "间隔保存失败。";;
+            7) value="$(prompt_number "ping 次数" "$PING_COUNT" 1 10)"; config_command task-set "$task_id" ping_count "$value" || fail "ping 次数保存失败。";;
+            8) value="$(prompt_number "检测轮数" "$CHECK_ROUNDS" 1 10)"; config_command task-set "$task_id" check_rounds "$value" || fail "检测轮数保存失败。";;
+            9) value="$(prompt_number "ping 超时" "$PING_TIMEOUT" 1 30)"; config_command task-set "$task_id" ping_timeout "$value" || fail "ping 超时保存失败。";;
+            10) value="$(prompt_number "轮次等待" "$ROUND_DELAY" 0 60)"; config_command task-set "$task_id" round_delay "$value" || fail "轮次等待保存失败。";;
+            11) value="$(prompt_number "最大并发" "$MAX_PARALLEL" 1 100)"; config_command task-set "$task_id" max_parallel "$value" || fail "最大并发保存失败。";;
+            12) config_command task-set "$task_id" health_enabled "$([[ "$HEALTH_ENABLED" == 1 ]] && printf 0 || printf 1)" || fail "健康删除设置保存失败。";;
+            13) config_command task-set "$task_id" prune_stale_ddns "$([[ "$PRUNE_STALE_DDNS" == 1 ]] && printf 0 || printf 1)" || fail "DDNS 清理设置保存失败。";;
             0) restart_daemon_if_running; return;; *) warn "无效选项。";;
         esac
         ok "任务设置已更新。"
@@ -1328,12 +1551,17 @@ check_task() (
         fi
     fi
     if [[ "$HEALTH_ENABLED" != 1 ]]; then
+        dns_command "$TASK_ID" rebalance || log_msg "注意" "[${TASK_NAME}] 备用解析补位失败。"
         log_msg "完成" "[${TASK_NAME}] DDNS 同步完成；健康删除已关闭。"; exit 0
     fi
     records_output="$(dns_command "$TASK_ID" records)" || { log_msg "错误" "[${TASK_NAME}] 读取 DNS 记录失败。"; exit 1; }
     ips=()
     while IFS= read -r ip; do [[ -n "$ip" ]] && ips+=("$ip"); done <<< "$records_output"
-    if ((${#ips[@]} == 0)); then log_msg "注意" "[${TASK_NAME}] ${DOMAIN} 没有 ${RECORD_TYPE} 地址。"; exit 0; fi
+    if ((${#ips[@]} == 0)); then
+        dns_command "$TASK_ID" rebalance || log_msg "注意" "[${TASK_NAME}] 空记录补位失败。"
+        log_msg "注意" "[${TASK_NAME}] ${DOMAIN} 没有 ${RECORD_TYPE} 地址。"
+        exit 0
+    fi
 
     log_msg "信息" "[${TASK_NAME}] 开始检测 ${#ips[@]} 个 IPv${IP_VERSION} 地址。"
     temp_dir="$(mktemp -d "${STATE_DIR}/check-${TASK_ID}.XXXXXX")"
@@ -1358,19 +1586,28 @@ check_task() (
         ((index++))
     done
     rm -rf -- "$temp_dir"
-    ((${#failed[@]} > 0)) || { log_msg "完成" "[${TASK_NAME}] 全部地址可达。"; exit 0; }
+    ((${#failed[@]} > 0)) || {
+        dns_command "$TASK_ID" rebalance || log_msg "注意" "[${TASK_NAME}] 活动解析整理失败。"
+        log_msg "完成" "[${TASK_NAME}] 全部地址可达。"; exit 0
+    }
     if ((${#failed[@]} == ${#ips[@]})); then
         if ((${#failed[@]} == 1)); then
-            log_msg "注意" "[${TASK_NAME}] 唯一地址失败，安全策略保留待人工确认。"; exit 0
+            if ((BACKUP_COUNT == 0)); then
+                log_msg "注意" "[${TASK_NAME}] 唯一地址失败且没有备用 IP，保留待人工确认。"; exit 0
+            fi
+            log_msg "注意" "[${TASK_NAME}] 唯一地址失败，将使用备用 IP 补位。"
         fi
-        retained_ip="${failed[0]}"; failed=("${failed[@]:1}")
-        log_msg "注意" "[${TASK_NAME}] 所有地址失败，保留 ${retained_ip}，删除其他失败地址。"
+        if ((${#failed[@]} > 1)); then
+            retained_ip="${failed[0]}"; failed=("${failed[@]:1}")
+            log_msg "注意" "[${TASK_NAME}] 所有地址失败，保留 ${retained_ip}，删除其他失败地址。"
+        fi
     fi
     if dns_command "$TASK_ID" remove "${failed[@]}"; then
         log_msg "完成" "[${TASK_NAME}] 已删除 ${#failed[@]} 个失效地址。"
     else
         log_msg "错误" "[${TASK_NAME}] 更新 DNS 失败，下轮重试。"; exit 1
     fi
+    dns_command "$TASK_ID" rebalance || log_msg "注意" "[${TASK_NAME}] 删除后备用解析补位失败。"
 )
 
 check_all_tasks() {
@@ -1404,24 +1641,26 @@ task_detail_menu() {
         printf '  华为账号: %s\n' "$ACCOUNT_NAME"
         printf '  任务状态: %s\n' "$([[ "$ENABLED" == 1 ]] && printf '启用' || printf '停用')"
         printf '  执行间隔: %s 秒\n' "$INTERVAL"
-        printf '  DDNS 来源: %s 个\n\n' "$DDNS_COUNT"
+        printf '  DDNS 来源: %s 个\n' "$DDNS_COUNT"
+        printf '  备用解析: %s 个（活动最多 %s 个）\n\n' "$BACKUP_COUNT" "$MAX_ACTIVE_IPS"
         menu_item 1 "查看解析记录"
-        menu_item 2 "添加 IP"
-        menu_item 3 "删除 IP"
+        menu_item 2 "添加活动解析 IP（超过 50 个自动进入备用池）"
+        menu_item 3 "删除活动解析 IP（自动从备用池补位）"
         menu_item 4 "立即检测 / 同步一轮"
         menu_item 5 "DDNS 来源管理"
-        menu_item 6 "修改任务设置"
-        menu_item 7 "$([[ "$ENABLED" == 1 ]] && printf '停用任务' || printf '启用任务')"
-        menu_item 8 "测试账号与域名"
-        menu_item 9 "删除任务"
+        menu_item 6 "备用解析 IP 管理"
+        menu_item 7 "修改任务设置"
+        menu_item 8 "$([[ "$ENABLED" == 1 ]] && printf '停用任务' || printf '启用任务')"
+        menu_item 9 "测试账号与域名"
+        menu_item 10 "删除任务"
         menu_item 0 "返回"
         choice="$(prompt "请选择" "0")"
         case "$choice" in
             1) task_show_records "$task_id"; pause_menu;; 2) task_add_ips "$task_id"; pause_menu;;
             3) task_remove_ips "$task_id"; pause_menu;; 4) check_task "$task_id"; pause_menu;;
-            5) ddns_menu "$task_id";; 6) edit_task_settings "$task_id";;
-            7) config_command task-set "$task_id" enabled "$([[ "$ENABLED" == 1 ]] && printf 0 || printf 1)"; restart_daemon_if_running;;
-            8) dns_command "$task_id" test; pause_menu;; 9) delete_task "$task_id"; return;;
+            5) ddns_menu "$task_id";; 6) backup_menu "$task_id";; 7) edit_task_settings "$task_id";;
+            8) config_command task-set "$task_id" enabled "$([[ "$ENABLED" == 1 ]] && printf 0 || printf 1)"; restart_daemon_if_running;;
+            9) dns_command "$task_id" test; pause_menu;; 10) delete_task "$task_id"; return;;
             0) return;; *) warn "无效选项。";;
         esac
     done
@@ -1617,6 +1856,9 @@ show_help() {
   sudo bash huwei.sh --list --task ID        查看任务的 A/AAAA 记录
   sudo bash huwei.sh --add IP... --task ID   添加 IPv4/IPv6 地址
   sudo bash huwei.sh --remove IP... --task ID 删除地址
+  sudo bash huwei.sh --backup-list --task ID 查看备用 IP
+  sudo bash huwei.sh --backup-add IP... --task ID 添加备用 IP
+  sudo bash huwei.sh --backup-remove IP... --task ID 删除备用 IP
   sudo bash huwei.sh --check [--task ID]     检测指定任务或全部任务
   sudo bash huwei.sh --ddns-sync --task ID   立即同步任务的 DDNS 来源
   sudo bash huwei.sh --start | --stop        启停多任务定时服务
@@ -1657,6 +1899,20 @@ main() {
                 valid_ip_for_version "$cli_ip" "$IP_VERSION" || { fail "地址 ${cli_ip} 与任务 IPv${IP_VERSION} 不匹配。"; exit 1; }
             done
             dns_command "$TASK_ID" "$local_action" "${CLI_ARGS[@]}";;
+        --backup-list|--backup-add|--backup-remove)
+            local_action="${1#--}"; shift; extract_task_option "$@" || exit 1
+            [[ -n "$CLI_TASK_ID" ]] || { fail "备用 IP 操作必须指定 --task。"; exit 1; }
+            if [[ "$local_action" == "list" ]]; then
+                ((${#CLI_ARGS[@]} == 0)) || { fail "--backup-list 不接受 IP 参数。"; exit 1; }
+                config_command backup-list "$CLI_TASK_ID"
+            else
+                ((${#CLI_ARGS[@]} > 0)) || { fail "请提供至少一个备用 IP。"; exit 1; }
+                load_task "$CLI_TASK_ID" || exit 1
+                for cli_ip in "${CLI_ARGS[@]}"; do
+                    valid_ip_for_version "$cli_ip" "$IP_VERSION" || { fail "地址 ${cli_ip} 与任务 IPv${IP_VERSION} 不匹配。"; exit 1; }
+                done
+                config_command "backup-${local_action#backup-}" "$TASK_ID" "${CLI_ARGS[@]}"
+            fi;;
         --check)
             shift; extract_task_option "$@" || exit 1
             ((${#CLI_ARGS[@]} == 0)) || { fail "--check 不接受其他参数。"; exit 1; }
