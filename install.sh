@@ -258,14 +258,19 @@ def normalize(data):
                 ddns_id = clean_text(value.get("id")) or f"ddns-{index}"
                 ddns_name = clean_text(value.get("name"))
                 ddns_domain = clean_text(value.get("domain")).rstrip(".").lower()
+                ddns_backup = clean_text(value.get("backup_domain") or "").rstrip(".").lower()
+                if "backup_domain" not in value:
+                    migrated = True
             else:
                 ddns_id = f"ddns-migrated-{index}"
                 ddns_domain = clean_text(value).rstrip(".").lower()
                 ddns_name = ddns_domain
+                ddns_backup = ""
                 migrated = True
             if not ddns_domain or ddns_domain in seen_domains:
                 continue
-            ddns_items.append({"id": ddns_id, "name": ddns_name or ddns_domain, "domain": ddns_domain})
+            ddns_items.append({"id": ddns_id, "name": ddns_name or ddns_domain,
+                               "domain": ddns_domain, "backup_domain": ddns_backup})
             seen_domains.add(ddns_domain)
         task["ddns_domains"] = sorted(ddns_items, key=lambda item: (item["name"], item["domain"]))
         backup_items = task.get("backup_ips", [])
@@ -326,6 +331,7 @@ def validate(data):
             raise RuntimeError("任务 IP 类型必须是 4 或 6")
         ddns_ids = set()
         ddns_names = set()
+        ddns_domains = set()
         for ddns in task["ddns_domains"]:
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", ddns["id"]):
                 raise RuntimeError("DDNS ID 无效")
@@ -340,6 +346,17 @@ def validate(data):
             ddns_names.add(normalized_name)
             if not domain_pattern.fullmatch(ddns["domain"]):
                 raise RuntimeError(f"DDNS 域名无效: {ddns['domain']}")
+            if ddns["domain"] in ddns_domains:
+                raise RuntimeError(f"任务 {task['name']} 的 DDNS 域名重复: {ddns['domain']}")
+            ddns_domains.add(ddns["domain"])
+            if ddns.get("backup_domain"):
+                if not domain_pattern.fullmatch(ddns["backup_domain"]):
+                    raise RuntimeError(f"备用 DDNS 域名无效: {ddns['backup_domain']}")
+                if ddns["backup_domain"] == ddns["domain"]:
+                    raise RuntimeError("备用 DDNS 域名不能与主 DDNS 域名相同")
+                if ddns["backup_domain"] in ddns_domains:
+                    raise RuntimeError(f"任务 {task['name']} 的备用 DDNS 域名与其他主域名重复")
+                ddns_domains.add(ddns["backup_domain"])
         try:
             backup_ips = [str(ipaddress.ip_address(value)) for value in task["backup_ips"]]
         except ValueError as error:
@@ -499,7 +516,7 @@ elif action == "task-delete":
     mutated = True
 elif action == "ddns-list":
     for item in find_task(data, args[0])["ddns_domains"]:
-        print(f"{item['id']}\t{item['name']}\t{item['domain']}")
+        print(f"{item['id']}\t{item['name']}\t{item['domain']}\t{item.get('backup_domain', '')}")
 elif action == "backup-list":
     for value in find_task(data, args[0])["backup_ips"]:
         print(value)
@@ -516,14 +533,20 @@ elif action == "backup-remove":
     task["backup_ips"] = [value for value in task["backup_ips"] if value not in removals]
     mutated = True
 elif action == "ddns-add":
-    task_id, ddns_id, name, domain = args
+    task_id, ddns_id, name, domain, backup_domain = args
     task = find_task(data, task_id)
     domain = clean_text(domain).rstrip(".").lower()
     if any(item["id"] == ddns_id for item in task["ddns_domains"]):
         raise RuntimeError("DDNS ID 已存在")
     if any(item["domain"] == domain for item in task["ddns_domains"]):
         raise RuntimeError("该 DDNS 域名已经绑定到任务")
-    task["ddns_domains"].append({"id": ddns_id, "name": clean_text(name), "domain": domain})
+    backup_domain = clean_text(backup_domain).rstrip(".").lower()
+    if backup_domain and (backup_domain == domain or any(item.get("backup_domain") == backup_domain
+                                                        or item["domain"] == backup_domain
+                                                        for item in task["ddns_domains"])):
+        raise RuntimeError("该备用 DDNS 域名已经绑定到任务")
+    task["ddns_domains"].append({"id": ddns_id, "name": clean_text(name), "domain": domain,
+                                  "backup_domain": backup_domain})
     task["ddns_domains"].sort(key=lambda item: (item["name"], item["domain"]))
     mutated = True
 elif action == "ddns-remove":
@@ -535,7 +558,7 @@ elif action == "ddns-remove":
     task["ddns_domains"].remove(item)
     mutated = True
 elif action == "ddns-update":
-    task_id, ddns_id, name, domain = args
+    task_id, ddns_id, name, domain, backup_domain = args
     task = find_task(data, task_id)
     item = next((item for item in task["ddns_domains"] if item["id"] == ddns_id), None)
     if not item:
@@ -543,7 +566,12 @@ elif action == "ddns-update":
     domain = clean_text(domain).rstrip(".").lower()
     if any(other["domain"] == domain and other["id"] != ddns_id for other in task["ddns_domains"]):
         raise RuntimeError("该 DDNS 域名已经绑定到任务")
-    item.update({"name": clean_text(name), "domain": domain})
+    backup_domain = clean_text(backup_domain).rstrip(".").lower()
+    if backup_domain and (backup_domain == domain or any(
+            other.get("backup_domain") == backup_domain or other["domain"] == backup_domain
+            for other in task["ddns_domains"] if other["id"] != ddns_id)):
+        raise RuntimeError("该备用 DDNS 域名已经绑定到任务")
+    item.update({"name": clean_text(name), "domain": domain, "backup_domain": backup_domain})
     task["ddns_domains"].sort(key=lambda value: (value["name"], value["domain"]))
     mutated = True
 elif action == "enabled-runtime":
@@ -829,23 +857,54 @@ def load_ddns_state():
         with open(state_path(), "r", encoding="utf-8") as handle:
             value = json.load(handle)
         sources = {}
-        for name, records in value.get("sources", {}).items():
-            valid = []
-            for record in records:
-                try:
-                    valid.append(str(address_class(str(record).strip())))
-                except ipaddress.AddressValueError:
-                    pass
-            sources[name] = valid
+        for key, records in value.get("sources", {}).items():
+            # v1 state stored a bare list under the domain name; retain it as
+            # the primary cache so upgrades do not force an unnecessary lookup.
+            if isinstance(records, dict):
+                normalized = {}
+                for side in ("primary", "backup"):
+                    valid = []
+                    for record in records.get(side, []):
+                        try:
+                            valid.append(str(address_class(str(record).strip())))
+                        except ipaddress.AddressValueError:
+                            pass
+                    normalized[side] = valid
+                blocked = records.get("blocked", {})
+                normalized_blocked = {}
+                for side in ("primary", "backup"):
+                    valid = []
+                    for record in blocked.get(side, []) if isinstance(blocked, dict) else []:
+                        try:
+                            valid.append(str(address_class(str(record).strip())))
+                        except ipaddress.AddressValueError:
+                            pass
+                    normalized_blocked[side] = valid
+                normalized["blocked"] = normalized_blocked
+                domains = records.get("domains", {})
+                normalized["domains"] = domains if isinstance(domains, dict) else {}
+                sources[str(key)] = normalized
+            else:
+                valid = []
+                for record in records if isinstance(records, list) else []:
+                    try:
+                        valid.append(str(address_class(str(record).strip())))
+                    except ipaddress.AddressValueError:
+                        pass
+                sources[str(key)] = {"primary": valid, "backup": [],
+                                     "blocked": {"primary": [], "backup": []}, "domains": {}}
         owned = []
         for record in value.get("owned", []):
             try:
                 owned.append(str(address_class(str(record).strip())))
             except ipaddress.AddressValueError:
                 pass
-        return {"sources": sources, "owned": owned}
+        active_sources = value.get("active_sources", {})
+        if not isinstance(active_sources, dict):
+            active_sources = {}
+        return {"sources": sources, "active_sources": active_sources, "owned": owned}
     except (OSError, ValueError, TypeError):
-        return {"sources": {}, "owned": []}
+        return {"sources": {}, "active_sources": {}, "owned": []}
 
 
 def save_ddns_state(value):
@@ -929,23 +988,124 @@ def persist_backup(values):
 
 
 def sync_ddns(zone, recordset):
-    configured = [
-        normalize_name(item.get("domain", "")) if isinstance(item, dict) else normalize_name(item)
-        for item in task.get("ddns_domains", [])
-    ]
-    configured = [name for name in configured if name]
+    configured = []
+    for index, item in enumerate(task.get("ddns_domains", []), 1):
+        if not isinstance(item, dict):
+            item = {"id": f"legacy-{index}", "domain": item, "backup_domain": ""}
+        primary = normalize_name(item.get("domain", ""))
+        backup = normalize_name(item.get("backup_domain", ""))
+        if primary:
+            configured.append({"key": str(item.get("id") or primary), "primary": primary,
+                               "backup": backup})
     state = load_ddns_state()
-    sources = {name: values for name, values in state["sources"].items() if name in configured}
+    sources = {}
+    active_sources = {}
     errors = []
-    for name in configured:
-        try:
-            sources[name] = resolve_domain(name)
-        except RuntimeError as error:
-            errors.append(str(error))
-            if name not in sources:
-                sources[name] = []
-    desired = set(clean_records(v for values in sources.values() for v in values))
     existing = set(current_records(recordset))
+    desired = set()
+    resolved_now = 0
+    for source in configured:
+        key = source["key"]
+        legacy_key = key not in state["sources"] and source["primary"] in state["sources"]
+        cached = state["sources"].get(key) or state["sources"].get(source["primary"], {})
+        if not isinstance(cached, dict):
+            cached = {"primary": [], "backup": []}
+        cached_domains = cached.get("domains", {})
+        if not isinstance(cached_domains, dict):
+            cached_domains = {}
+        if legacy_key and not cached_domains:
+            cached_domains = {"primary": source["primary"], "backup": ""}
+        for side_name in ("primary", "backup"):
+            if cached_domains.get(side_name) != source[side_name]:
+                cached[side_name] = []
+                if isinstance(cached.get("blocked"), dict):
+                    cached["blocked"][side_name] = []
+        cached["domains"] = {"primary": source["primary"], "backup": source["backup"]}
+        blocked = cached.get("blocked", {})
+        if not isinstance(blocked, dict):
+            blocked = {}
+        for side_name in ("primary", "backup"):
+            blocked[side_name] = set(clean_records(blocked.get(side_name, []))) if blocked.get(side_name) else set()
+            # If an operator or another process restored an address, it is no
+            # longer blocked and may be accepted again on the next lookup.
+            blocked[side_name] -= existing
+        cached["blocked"] = blocked
+        side = state.get("active_sources", {}).get(key, "primary")
+        if side not in ("primary", "backup") or (side == "backup" and not source["backup"]):
+            side = "primary"
+        domain_name = source[side]
+        if not domain_name:
+            side = "primary"
+            domain_name = source["primary"]
+        records = clean_records(cached.get(side, [])) if cached.get(side) else []
+
+        # Cached DDNS answers are authoritative until health checks remove them.
+        # Only then perform a new lookup, avoiding repeated DNS traffic each run.
+        stale_cached = bool((records and set(records) - existing) or
+                            (not records and blocked[side]))
+        needs_lookup = not records or stale_cached
+        if needs_lookup:
+            old_records = set(records)
+            blocked[side] |= old_records - existing
+            try:
+                fresh = resolve_domain(domain_name)
+                resolved_now += 1
+                if fresh:
+                    fresh_set = set(fresh)
+                    records = sorted(fresh_set - blocked[side],
+                                     key=lambda value: int(address_class(value)))
+                    # Keep blocked answers in the separate set, but do not
+                    # keep them in the active cache or they would retrigger
+                    # lookups while a replacement remains healthy.
+                    cached[side] = records
+                else:
+                    records = []
+            except RuntimeError as error:
+                errors.append(str(error))
+                # Keep healthy members of a partially removed answer set;
+                # never delete unrelated live records just because DNS timed
+                # out. Fully removed answers remain absent and can trigger
+                # the paired fallback below.
+                records = sorted(old_records & existing,
+                                 key=lambda value: int(address_class(value)))
+
+            # A failed/stale primary immediately falls back to its paired
+            # backup. The reverse happens when the backup later disappears.
+            # Only switch sides when the just-refreshed answer did not
+            # produce a replacement for a previously cached, removed answer.
+            if stale_cached and (not records or
+                                 (not (set(records) & existing) and not (set(records) - old_records))):
+                other = "backup" if side == "primary" else "primary"
+                other_domain = source[other]
+                switched = False
+                if other_domain:
+                    other_records = clean_records(cached.get(other, [])) if cached.get(other) else []
+                    blocked[other] |= set(other_records) - existing
+                    try:
+                        fallback = resolve_domain(other_domain)
+                        resolved_now += 1
+                        if fallback:
+                            fallback_set = set(fallback)
+                            usable = fallback_set - blocked[other]
+                            cached[other] = sorted(usable,
+                                                   key=lambda value: int(address_class(value)))
+                            if usable:
+                                side = other
+                                records = sorted(usable, key=lambda value: int(address_class(value)))
+                                switched = True
+                    except RuntimeError as error:
+                        errors.append(str(error))
+                if not switched:
+                    records = sorted(old_records & existing,
+                                     key=lambda value: int(address_class(value)))
+        sources[key] = {"primary": clean_records(cached.get("primary", [])),
+                        "backup": clean_records(cached.get("backup", [])),
+                        "blocked": {"primary": clean_records(blocked["primary"]),
+                                    "backup": clean_records(blocked["backup"])},
+                        "domains": cached["domains"]}
+        active_sources[key] = side
+        desired.update(records)
+
     configured_backup = set(backup_records())
     old_owned = set(clean_records(state.get("owned", [])))
     stale = old_owned - desired if task.get("prune_stale_ddns", True) else set()
@@ -960,9 +1120,10 @@ def sync_ddns(zone, recordset):
     persist_backup(overflow)
     owned = (old_owned - stale) | additions
     owned &= desired
-    save_ddns_state({"sources": sources, "owned": clean_records(owned),
+    save_ddns_state({"sources": sources, "active_sources": active_sources,
+                     "owned": clean_records(owned),
                      "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
-    print(f"DDNS 同步：来源 {len(configured)} 个，新增 {len(additions)}，清理旧地址 {len(stale)}，活动 {len(active)} 个，备用 {len(overflow)} 个。")
+    print(f"DDNS 同步：来源 {len(configured)} 个，本次解析 {resolved_now} 次，新增 {len(additions)}，清理旧地址 {len(stale)}，活动 {len(active)} 个，备用 {len(overflow)} 个。")
     for message in errors:
         print(f"注意：{message}；已保留该来源上次的地址。", file=sys.stderr)
 
@@ -979,7 +1140,9 @@ def print_summary(zone, recordset):
     print(f"备用解析: {len(task.get('backup_ips', []))} 个")
     for source in task.get("ddns_domains", []):
         if isinstance(source, dict):
-            print(f"  [{source.get('name', '')}] {source.get('domain', '')}")
+            backup = source.get("backup_domain", "")
+            print(f"  [{source.get('name', '')}] 主：{source.get('domain', '')}"
+                  f"；备用：{backup or '无'}")
     if not recordset:
         print("记录状态: 尚未创建\nIP 数量: 0")
         return
@@ -1369,7 +1532,7 @@ task_show_records() {
 }
 
 ddns_add() {
-    local task_id="$1" id name domain
+    local task_id="$1" id name domain backup_domain
     load_task "$task_id" || return 1
     name="$(trim "$(prompt "DDNS 名称，例如 家里宽带")")"
     [[ -n "$name" ]] || { fail "DDNS 名称不能为空。"; return 1; }
@@ -1383,18 +1546,32 @@ ddns_add() {
         fail "DDNS 域名类型与任务 IPv${IP_VERSION} 不匹配，未添加。"
         return 1
     fi
+    while true; do
+        backup_domain="$(trim "$(prompt "备用 DDNS 完整域名（可留空）")")"
+        backup_domain="${backup_domain%.}"
+        [[ -z "$backup_domain" ]] && break
+        [[ "$backup_domain" != "$domain" ]] && valid_domain "$backup_domain" && break
+        fail "备用域名格式无效，且不能与主域名相同。"
+    done
+    if [[ -n "$backup_domain" ]]; then
+        info "正在确认备用 ${backup_domain} 可解析出 IPv${IP_VERSION} 地址..."
+        dns_command "$TASK_ID" ddns-check "${backup_domain,,}" || {
+            fail "备用 DDNS 域名类型与任务 IPv${IP_VERSION} 不匹配，未添加。"
+            return 1
+        }
+    fi
     id="$(new_id ddns)"
-    config_command ddns-add "$TASK_ID" "$id" "$name" "${domain,,}" || return 1
-    ok "DDNS 来源已添加：${name}（${domain,,}）。"
+    config_command ddns-add "$TASK_ID" "$id" "$name" "${domain,,}" "${backup_domain,,}" || return 1
+    ok "DDNS 来源已添加：${name}（${domain,,}，备用：${backup_domain:-无}）。"
     dns_command "$TASK_ID" sync-ddns || warn "已绑定，但本次同步失败。"
 }
 
 list_ddns() {
-    local task_id="$1" id name domain found=0 index=1
+    local task_id="$1" id name domain backup_domain found=0 index=1
     menu_title "DDNS 来源"
-    while IFS=$'\t' read -r id name domain; do
+    while IFS=$'\t' read -r id name domain backup_domain; do
         [[ -n "$id" ]] || continue
-        printf '  %d. %s | %s\n' "$index" "$name" "$domain"
+        printf '  %d. %s | 主：%s | 备用：%s\n' "$index" "$name" "$domain" "${backup_domain:-无}"
         found=1; ((index++))
     done < <(config_command ddns-list "$task_id")
     ((found == 1)) || printf '  暂无 DDNS 来源。\n'
@@ -1402,14 +1579,14 @@ list_ddns() {
 
 ddns_edit() {
     local task_id="$1"
-    local -a ids names domains
-    local id name domain choice new_name new_domain index=1
-    ids=(); names=(); domains=()
+    local -a ids names domains backups
+    local id name domain backup_domain choice new_name new_domain new_backup index=1
+    ids=(); names=(); domains=(); backups=()
     menu_title "选择要修改的 DDNS 来源"
-    while IFS=$'\t' read -r id name domain; do
+    while IFS=$'\t' read -r id name domain backup_domain; do
         [[ -n "$id" ]] || continue
-        ids+=("$id"); names+=("$name"); domains+=("$domain")
-        printf '  %d. %s | %s\n' "$index" "$name" "$domain"; ((index++))
+        ids+=("$id"); names+=("$name"); domains+=("$domain"); backups+=("$backup_domain")
+        printf '  %d. %s | 主：%s | 备用：%s\n' "$index" "$name" "$domain" "${backup_domain:-无}"; ((index++))
     done < <(config_command ddns-list "$task_id")
     ((${#ids[@]} > 0)) || { warn "该任务没有 DDNS 来源。"; return 1; }
     choice="$(prompt "要修改的序号")"
@@ -1417,6 +1594,7 @@ ddns_edit() {
     id="${ids[$((10#$choice - 1))]}"
     name="${names[$((10#$choice - 1))]}"
     domain="${domains[$((10#$choice - 1))]}"
+    backup_domain="${backups[$((10#$choice - 1))]}"
     new_name="$(trim "$(prompt "DDNS 名称" "$name")")"
     [[ -n "$new_name" ]] || { fail "DDNS 名称不能为空。"; return 1; }
     while true; do
@@ -1425,26 +1603,40 @@ ddns_edit() {
         valid_domain "$new_domain" && break
         fail "域名格式无效。"
     done
+    while true; do
+        new_backup="$(trim "$(prompt "备用 DDNS 完整域名（可留空）" "$backup_domain")")"
+        new_backup="${new_backup%.}"
+        [[ -z "$new_backup" ]] && break
+        [[ "$new_backup" != "$new_domain" ]] && valid_domain "$new_backup" && break
+        fail "备用域名格式无效，且不能与主域名相同。"
+    done
     info "正在确认 ${new_domain} 可解析出 IPv${IP_VERSION} 地址..."
     dns_command "$TASK_ID" ddns-check "${new_domain,,}" || {
         fail "DDNS 域名类型与任务 IPv${IP_VERSION} 不匹配，未修改。"
         return 1
     }
-    config_command ddns-update "$task_id" "$id" "$new_name" "${new_domain,,}" || return 1
+    if [[ -n "$new_backup" ]]; then
+        info "正在确认备用 ${new_backup} 可解析出 IPv${IP_VERSION} 地址..."
+        dns_command "$TASK_ID" ddns-check "${new_backup,,}" || {
+            fail "备用 DDNS 域名类型与任务 IPv${IP_VERSION} 不匹配，未修改。"
+            return 1
+        }
+    fi
+    config_command ddns-update "$task_id" "$id" "$new_name" "${new_domain,,}" "${new_backup,,}" || return 1
     ok "DDNS 来源已更新。"
     dns_command "$task_id" sync-ddns || warn "配置已更新，但本次同步失败。"
 }
 
 ddns_remove() {
     local task_id="$1"
-    local -a ids names domains
-    local id name domain choice index=1
-    ids=(); names=(); domains=()
+    local -a ids names domains backups
+    local id name domain backup_domain choice index=1
+    ids=(); names=(); domains=(); backups=()
     menu_title "选择要删除的 DDNS 来源"
-    while IFS=$'\t' read -r id name domain; do
+    while IFS=$'\t' read -r id name domain backup_domain; do
         [[ -n "$id" ]] || continue
-        ids+=("$id"); names+=("$name"); domains+=("$domain")
-        printf '  %d. %s | %s\n' "$index" "$name" "$domain"; ((index++))
+        ids+=("$id"); names+=("$name"); domains+=("$domain"); backups+=("$backup_domain")
+        printf '  %d. %s | 主：%s | 备用：%s\n' "$index" "$name" "$domain" "${backup_domain:-无}"; ((index++))
     done < <(config_command ddns-list "$task_id")
     ((${#ids[@]} > 0)) || { warn "该任务没有 DDNS 来源。"; return 1; }
     choice="$(prompt "要删除的序号")"
