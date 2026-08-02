@@ -1041,8 +1041,9 @@ def sync_ddns(zone, recordset):
 
         # Cached DDNS answers are authoritative until health checks remove them.
         # Only then perform a new lookup, avoiding repeated DNS traffic each run.
+        source_blocked = blocked["primary"] | blocked["backup"]
         stale_cached = bool((records and set(records) - existing) or
-                            (not records and blocked[side]))
+                            (not records and source_blocked))
         needs_lookup = not records or stale_cached
         if needs_lookup:
             old_records = set(records)
@@ -1052,7 +1053,9 @@ def sync_ddns(zone, recordset):
                 resolved_now += 1
                 if fresh:
                     fresh_set = set(fresh)
-                    records = sorted(fresh_set - blocked[side],
+                    other_side = "backup" if side == "primary" else "primary"
+                    blocked_for_source = blocked[side] | blocked[other_side]
+                    records = sorted(fresh_set - blocked_for_source,
                                      key=lambda value: int(address_class(value)))
                     # Keep blocked answers in the separate set, but do not
                     # keep them in the active cache or they would retrigger
@@ -1086,7 +1089,7 @@ def sync_ddns(zone, recordset):
                         resolved_now += 1
                         if fallback:
                             fallback_set = set(fallback)
-                            usable = fallback_set - blocked[other]
+                            usable = fallback_set - blocked[other] - blocked[side]
                             cached[other] = sorted(usable,
                                                    key=lambda value: int(address_class(value)))
                             if usable:
@@ -1747,7 +1750,7 @@ check_one_ip() {
 }
 
 check_task() (
-    local task_id="$1" records_output ip index running pid result temp_dir retained_ip
+    local task_id="$1" records_output ip index running pid result temp_dir
     local -a ips pids failed
     load_task "$task_id" || exit 1
     command -v ping >/dev/null 2>&1 || { fail "缺少 ping 命令。"; exit 1; }
@@ -1802,16 +1805,7 @@ check_task() (
         log_msg "完成" "[${TASK_NAME}] 全部地址可达。"; exit 0
     }
     if ((${#failed[@]} == ${#ips[@]})); then
-        if ((${#failed[@]} == 1)); then
-            if ((BACKUP_COUNT == 0)); then
-                log_msg "注意" "[${TASK_NAME}] 唯一地址失败且没有备用 IP，保留待人工确认。"; exit 0
-            fi
-            log_msg "注意" "[${TASK_NAME}] 唯一地址失败，将使用备用 IP 补位。"
-        fi
-        if ((${#failed[@]} > 1)); then
-            retained_ip="${failed[0]}"; failed=("${failed[@]:1}")
-            log_msg "注意" "[${TASK_NAME}] 所有地址失败，保留 ${retained_ip}，删除其他失败地址。"
-        fi
+        log_msg "注意" "[${TASK_NAME}] 所有地址连续检测失败，将全部删除；下一轮将重新同步 DDNS 或补入备用 IP。"
     fi
     if dns_command "$TASK_ID" remove "${failed[@]}"; then
         log_msg "完成" "[${TASK_NAME}] 已删除 ${#failed[@]} 个失效地址。"
