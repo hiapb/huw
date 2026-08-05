@@ -870,17 +870,6 @@ def load_ddns_state():
                         except ipaddress.AddressValueError:
                             pass
                     normalized[side] = valid
-                blocked = records.get("blocked", {})
-                normalized_blocked = {}
-                for side in ("primary", "backup"):
-                    valid = []
-                    for record in blocked.get(side, []) if isinstance(blocked, dict) else []:
-                        try:
-                            valid.append(str(address_class(str(record).strip())))
-                        except ipaddress.AddressValueError:
-                            pass
-                    normalized_blocked[side] = valid
-                normalized["blocked"] = normalized_blocked
                 domains = records.get("domains", {})
                 normalized["domains"] = domains if isinstance(domains, dict) else {}
                 sources[str(key)] = normalized
@@ -891,8 +880,7 @@ def load_ddns_state():
                         valid.append(str(address_class(str(record).strip())))
                     except ipaddress.AddressValueError:
                         pass
-                sources[str(key)] = {"primary": valid, "backup": [],
-                                     "blocked": {"primary": [], "backup": []}, "domains": {}}
+                sources[str(key)] = {"primary": valid, "backup": [], "domains": {}}
         owned = []
         for record in value.get("owned", []):
             try:
@@ -1018,18 +1006,7 @@ def sync_ddns(zone, recordset):
         for side_name in ("primary", "backup"):
             if cached_domains.get(side_name) != source[side_name]:
                 cached[side_name] = []
-                if isinstance(cached.get("blocked"), dict):
-                    cached["blocked"][side_name] = []
         cached["domains"] = {"primary": source["primary"], "backup": source["backup"]}
-        blocked = cached.get("blocked", {})
-        if not isinstance(blocked, dict):
-            blocked = {}
-        for side_name in ("primary", "backup"):
-            blocked[side_name] = set(clean_records(blocked.get(side_name, []))) if blocked.get(side_name) else set()
-            # If an operator or another process restored an address, it is no
-            # longer blocked and may be accepted again on the next lookup.
-            blocked[side_name] -= existing
-        cached["blocked"] = blocked
         side = state.get("active_sources", {}).get(key, "primary")
         if side not in ("primary", "backup") or (side == "backup" and not source["backup"]):
             side = "primary"
@@ -1041,25 +1018,15 @@ def sync_ddns(zone, recordset):
 
         # Cached DDNS answers are authoritative until health checks remove them.
         # Only then perform a new lookup, avoiding repeated DNS traffic each run.
-        source_blocked = blocked["primary"] | blocked["backup"]
-        stale_cached = bool((records and set(records) - existing) or
-                            (not records and source_blocked))
+        stale_cached = bool(records and set(records) - existing)
         needs_lookup = not records or stale_cached
         if needs_lookup:
             old_records = set(records)
-            blocked[side] |= old_records - existing
             try:
                 fresh = resolve_domain(domain_name)
                 resolved_now += 1
                 if fresh:
-                    fresh_set = set(fresh)
-                    other_side = "backup" if side == "primary" else "primary"
-                    blocked_for_source = blocked[side] | blocked[other_side]
-                    records = sorted(fresh_set - blocked_for_source,
-                                     key=lambda value: int(address_class(value)))
-                    # Keep blocked answers in the separate set, but do not
-                    # keep them in the active cache or they would retrigger
-                    # lookups while a replacement remains healthy.
+                    records = clean_records(fresh)
                     cached[side] = records
                 else:
                     records = []
@@ -1083,18 +1050,15 @@ def sync_ddns(zone, recordset):
                 switched = False
                 if other_domain:
                     other_records = clean_records(cached.get(other, [])) if cached.get(other) else []
-                    blocked[other] |= set(other_records) - existing
                     try:
                         fallback = resolve_domain(other_domain)
                         resolved_now += 1
                         if fallback:
-                            fallback_set = set(fallback)
-                            usable = fallback_set - blocked[other] - blocked[side]
-                            cached[other] = sorted(usable,
-                                                   key=lambda value: int(address_class(value)))
-                            if usable:
+                            fallback_records = clean_records(fallback)
+                            cached[other] = fallback_records
+                            if fallback_records:
                                 side = other
-                                records = sorted(usable, key=lambda value: int(address_class(value)))
+                                records = fallback_records
                                 switched = True
                     except RuntimeError as error:
                         errors.append(str(error))
@@ -1103,8 +1067,6 @@ def sync_ddns(zone, recordset):
                                      key=lambda value: int(address_class(value)))
         sources[key] = {"primary": clean_records(cached.get("primary", [])),
                         "backup": clean_records(cached.get("backup", [])),
-                        "blocked": {"primary": clean_records(blocked["primary"]),
-                                    "backup": clean_records(blocked["backup"])},
                         "domains": cached["domains"]}
         active_sources[key] = side
         desired.update(records)
