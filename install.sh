@@ -667,6 +667,7 @@ import ipaddress
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -848,6 +849,28 @@ def resolve_domain(name):
     return clean_records(values)
 
 
+def probe_address(value):
+    """Accept a resolved address only when one of the configured probes works."""
+    count = max(1, int(task.get("ping_count", 3)))
+    timeout = max(1, int(task.get("ping_timeout", 2)))
+    command = ["ping", "-4" if version == 4 else "-6", "-n", "-c", "1",
+               "-W", str(timeout), value]
+    for _ in range(count):
+        try:
+            result = subprocess.run(command, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=timeout + 2,
+                                    check=False)
+            if result.returncode == 0:
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return False
+
+
+def healthy_records(values):
+    return [value for value in clean_records(values) if probe_address(value)]
+
+
 def state_path():
     return os.path.join(STATE_DIR, f"ddns-{TASK_ID}.json")
 
@@ -1026,7 +1049,7 @@ def sync_ddns(zone, recordset):
                 fresh = resolve_domain(domain_name)
                 resolved_now += 1
                 if fresh:
-                    records = clean_records(fresh)
+                    records = healthy_records(fresh)
                     cached[side] = records
                 else:
                     records = []
@@ -1054,7 +1077,7 @@ def sync_ddns(zone, recordset):
                         fallback = resolve_domain(other_domain)
                         resolved_now += 1
                         if fallback:
-                            fallback_records = clean_records(fallback)
+                            fallback_records = healthy_records(fallback)
                             cached[other] = fallback_records
                             if fallback_records:
                                 side = other
@@ -1975,7 +1998,7 @@ main_menu() {
     local choice
     while true; do
         show_menu_header
-        menu_item 1 "华为云账号管理"
+        menu_item 1 "华为云账号管理1"
         menu_item 2 "DNS 任务管理"
         menu_item 3 "立即运行全部任务"
         menu_item 4 "启动 / 更新定时服务"
