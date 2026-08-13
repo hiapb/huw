@@ -949,12 +949,16 @@ def save_config(value):
 
 def backup_records():
     values = []
+    seen = set()
     for value in task.get("backup_ips", []):
         try:
-            values.append(str(address_class(str(value).strip())))
+            normalized = str(address_class(str(value).strip()))
         except ipaddress.AddressValueError:
-            pass
-    return clean_records(values)
+            continue
+        if normalized not in seen:
+            values.append(normalized)
+            seen.add(normalized)
+    return values
 
 
 def allocate_records(active, candidates):
@@ -986,7 +990,17 @@ def allocate_records(active, candidates):
 
 
 def persist_backup(values):
-    values = clean_records(values)
+    normalized_values = []
+    seen = set()
+    for value in values:
+        try:
+            normalized = str(address_class(str(value).strip()))
+        except ipaddress.AddressValueError:
+            continue
+        if normalized not in seen:
+            normalized_values.append(normalized)
+            seen.add(normalized)
+    values = normalized_values
     task["backup_ips"] = values
     for item in config.get("tasks", []):
         if item.get("id") == TASK_ID:
@@ -1114,12 +1128,12 @@ def sync_ddns(zone, recordset):
         active_sources[key] = side
         desired.update(records)
 
-    configured_backup = set(backup_records())
+    configured_backup = backup_records()
     old_owned = set(clean_records(state.get("owned", [])))
     stale = old_owned - desired if task.get("prune_stale_ddns", True) else set()
     additions = desired - existing
     candidate_active = clean_records((existing - stale) | desired)
-    active, overflow = allocate_records(candidate_active, candidate_active + list(configured_backup))
+    active, overflow = allocate_records(candidate_active, candidate_active + configured_backup)
     if active != clean_records(existing):
         if active:
             create_or_update(zone, recordset, active, int(task.get("ttl", 300)))
