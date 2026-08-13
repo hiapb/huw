@@ -2071,7 +2071,7 @@ main_menu() {
     local choice
     while true; do
         show_menu_header
-        menu_item 1 "华为云账号管理"
+        menu_item 1 "华为云账号管理1"
         menu_item 2 "DNS 任务管理"
         menu_item 3 "立即运行全部任务"
         menu_item 4 "启动 / 更新定时服务"
