@@ -272,7 +272,7 @@ def normalize(data):
             ddns_items.append({"id": ddns_id, "name": ddns_name or ddns_domain,
                                "domain": ddns_domain, "backup_domain": ddns_backup})
             seen_domains.add(ddns_domain)
-        task["ddns_domains"] = sorted(ddns_items, key=lambda item: (item["name"], item["domain"]))
+        task["ddns_domains"] = ddns_items
         backup_items = task.get("backup_ips", [])
         if not isinstance(backup_items, list):
             backup_items = []
@@ -551,7 +551,6 @@ elif action == "ddns-add":
         raise RuntimeError("该备用 DDNS 域名已经绑定到任务")
     task["ddns_domains"].append({"id": ddns_id, "name": clean_text(name), "domain": domain,
                                   "backup_domain": backup_domain})
-    task["ddns_domains"].sort(key=lambda item: (item["name"], item["domain"]))
     mutated = True
 elif action == "ddns-remove":
     task_id, ddns_id = args
@@ -580,7 +579,6 @@ elif action == "ddns-update":
             for other in task["ddns_domains"] if other["id"] != ddns_id)):
         raise RuntimeError("该备用 DDNS 域名已经绑定到任务")
     item.update({"name": clean_text(name), "domain": domain, "backup_domain": backup_domain})
-    task["ddns_domains"].sort(key=lambda value: (value["name"], value["domain"]))
     mutated = True
 elif action == "enabled-runtime":
     for task in data["tasks"]:
@@ -807,13 +805,17 @@ def find_recordset(zone_id):
 
 
 def clean_records(values):
-    result = set()
+    result = []
+    seen = set()
     for value in values:
         try:
-            result.add(str(address_class(str(value).strip())))
+            normalized = str(address_class(str(value).strip()))
         except ipaddress.AddressValueError as error:
             raise RuntimeError(f"无效 IPv{version} 地址: {value}") from error
-    return sorted(result, key=lambda value: int(address_class(value)))
+        if normalized not in seen:
+            result.append(normalized)
+            seen.add(normalized)
+    return result
 
 
 def current_records(recordset):
@@ -1023,8 +1025,10 @@ def sync_ddns(zone, recordset):
     sources = {}
     active_sources = {}
     errors = []
-    existing = set(current_records(recordset))
-    desired = set()
+    existing_records = current_records(recordset)
+    existing = set(existing_records)
+    desired = []
+    desired_set = set()
     resolved_now = 0
     for source in configured:
         key = source["key"]
@@ -1046,11 +1050,14 @@ def sync_ddns(zone, recordset):
         blocked = cached.get("blocked", {})
         if not isinstance(blocked, dict):
             blocked = {}
+        blocked_order = {}
         for side_name in ("primary", "backup"):
-            blocked[side_name] = set(clean_records(blocked.get(side_name, []))) if blocked.get(side_name) else set()
+            blocked_order[side_name] = clean_records(blocked.get(side_name, [])) if blocked.get(side_name) else []
             # If an operator or another process restored an address, it is no
             # longer blocked and may be accepted again on the next lookup.
-            blocked[side_name] -= existing
+            blocked_order[side_name] = [value for value in blocked_order[side_name]
+                                        if value not in existing]
+            blocked[side_name] = set(blocked_order[side_name])
         cached["blocked"] = blocked
         side = state.get("active_sources", {}).get(key, "primary")
         if side not in ("primary", "backup") or (side == "backup" and not source["backup"]):
@@ -1068,8 +1075,12 @@ def sync_ddns(zone, recordset):
                             (not records and source_blocked))
         needs_lookup = not records or stale_cached
         if needs_lookup:
-            old_records = set(records)
-            blocked[side] |= old_records - existing
+            old_record_values = records
+            old_records = set(old_record_values)
+            newly_blocked = [value for value in old_record_values
+                             if value not in existing and value not in blocked[side]]
+            blocked_order[side].extend(newly_blocked)
+            blocked[side].update(newly_blocked)
             try:
                 fresh = resolve_domain(domain_name)
                 resolved_now += 1
@@ -1077,8 +1088,7 @@ def sync_ddns(zone, recordset):
                     fresh_set = set(fresh)
                     other_side = "backup" if side == "primary" else "primary"
                     blocked_for_source = blocked[side] | blocked[other_side]
-                    records = sorted(fresh_set - blocked_for_source,
-                                     key=lambda value: int(address_class(value)))
+                    records = [value for value in fresh if value not in blocked_for_source]
                     cached[side] = records
                 else:
                     records = []
@@ -1088,8 +1098,7 @@ def sync_ddns(zone, recordset):
                 # never delete unrelated live records just because DNS timed
                 # out. Fully removed answers remain absent and can trigger
                 # the paired fallback below.
-                records = sorted(old_records & existing,
-                                 key=lambda value: int(address_class(value)))
+                records = [value for value in old_record_values if value in existing]
 
             # A failed/stale primary immediately falls back to its paired
             # backup. The reverse happens when the backup later disappears.
@@ -1102,48 +1111,53 @@ def sync_ddns(zone, recordset):
                 switched = False
                 if other_domain:
                     other_records = clean_records(cached.get(other, [])) if cached.get(other) else []
-                    blocked[other] |= set(other_records) - existing
+                    newly_blocked = [value for value in other_records
+                                     if value not in existing and value not in blocked[other]]
+                    blocked_order[other].extend(newly_blocked)
+                    blocked[other].update(newly_blocked)
                     try:
                         fallback = resolve_domain(other_domain)
                         resolved_now += 1
                         if fallback:
                             fallback_set = set(fallback)
                             usable = fallback_set - blocked[other] - blocked[side]
-                            cached[other] = sorted(usable,
-                                                   key=lambda value: int(address_class(value)))
+                            cached[other] = [value for value in fallback if value in usable]
                             if usable:
                                 side = other
-                                records = sorted(usable, key=lambda value: int(address_class(value)))
+                                records = [value for value in fallback if value in usable]
                                 switched = True
                     except RuntimeError as error:
                         errors.append(str(error))
                 if not switched:
-                    records = sorted(old_records & existing,
-                                     key=lambda value: int(address_class(value)))
+                    records = [value for value in old_record_values if value in existing]
         sources[key] = {"primary": clean_records(cached.get("primary", [])),
                         "backup": clean_records(cached.get("backup", [])),
-                        "blocked": {"primary": clean_records(blocked["primary"]),
-                                    "backup": clean_records(blocked["backup"])},
+                        "blocked": blocked_order,
                         "domains": cached["domains"]}
         active_sources[key] = side
-        desired.update(records)
+        for value in records:
+            if value not in desired_set:
+                desired.append(value)
+                desired_set.add(value)
 
     configured_backup = backup_records()
-    old_owned = set(clean_records(state.get("owned", [])))
-    stale = old_owned - desired if task.get("prune_stale_ddns", True) else set()
-    additions = desired - existing
-    candidate_active = clean_records((existing - stale) | desired)
+    old_owned_values = clean_records(state.get("owned", []))
+    old_owned = set(old_owned_values)
+    stale = old_owned - desired_set if task.get("prune_stale_ddns", True) else set()
+    additions = [value for value in desired if value not in existing]
+    candidate_active = [value for value in existing_records if value not in stale]
+    candidate_active.extend(value for value in desired if value not in candidate_active)
     active, overflow = allocate_records(candidate_active, candidate_active + configured_backup)
-    if active != clean_records(existing):
+    if active != existing_records:
         if active:
             create_or_update(zone, recordset, active, int(task.get("ttl", 300)))
         elif recordset:
             api_request("DELETE", f"/v2/zones/{zone['id']}/recordsets/{recordset['id']}")
     persist_backup(overflow)
-    owned = (old_owned - stale) | additions
-    owned &= desired
+    owned = [value for value in old_owned_values if value not in stale and value in desired_set]
+    owned.extend(value for value in additions if value not in owned)
     save_ddns_state({"sources": sources, "active_sources": active_sources,
-                     "owned": clean_records(owned),
+                     "owned": owned,
                      "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()})
     print(f"DDNS 同步：来源 {len(configured)} 个，本次解析 {resolved_now} 次，新增 {len(additions)}，清理旧地址 {len(stale)}，活动 {len(active)} 个，备用 {len(overflow)} 个。")
     for message in errors:
@@ -2071,7 +2085,7 @@ main_menu() {
     local choice
     while true; do
         show_menu_header
-        menu_item 1 "华为云账号管理1"
+        menu_item 1 "华为云账号管理"
         menu_item 2 "DNS 任务管理"
         menu_item 3 "立即运行全部任务"
         menu_item 4 "启动 / 更新定时服务"
